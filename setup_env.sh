@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # ============================================================
 #  setup_env.sh  –  Manage environment variables for SW Rescue
-#  Stores all values in .env (next to this script)
+#  Updates values directly in:
+#    • docker-compose.yml
+#    • rescue_with_trigger.sh
 #  Run:  bash setup_env.sh
 # ============================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="$SCRIPT_DIR/.env"
+COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
+RESCUE_FILE="$SCRIPT_DIR/rescue_with_trigger.sh"
+USB_DEV_DEFAULT="/dev/sdb1"   # literal default path baked into docker-compose.yml
 
 # ─── colour helpers ──────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -18,22 +22,167 @@ ok()      { echo -e "${GREEN}[OK]${RESET}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
 section() { echo -e "\n${BOLD}${CYAN}═══ $* ═══${RESET}"; }
 
-# ─── read current value from .env (empty string if missing) ──
-current() {
-    local key="$1"
-    if [[ -f "$ENV_FILE" ]]; then
-        grep -E "^${key}=" "$ENV_FILE" | head -n1 | cut -d'=' -f2- | sed "s/^['\"]//;s/['\"]$//" || true
+# ─── validate target files exist ─────────────────────────────
+check_files() {
+    local missing=0
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo -e "${RED}[ERROR]${RESET} docker-compose.yml not found at: $COMPOSE_FILE"
+        missing=1
+    fi
+    if [[ ! -f "$RESCUE_FILE" ]]; then
+        echo -e "${RED}[ERROR]${RESET} rescue_with_trigger.sh not found at: $RESCUE_FILE"
+        missing=1
+    fi
+    if [[ $missing -eq 1 ]]; then
+        echo -e "${RED}${BOLD}Aborting – required files are missing.${RESET}"
+        exit 1
     fi
 }
 
-# ─── write / update a key=value pair in .env ─────────────────
+# ─── read current value for a key from both target files ─────
+#     Checks docker-compose.yml first, then rescue_with_trigger.sh
+#     Handles formats:
+#       docker-compose:         - KEY=value          (env block, list style)
+#                               KEY: value           (env block, map style)
+#       rescue_with_trigger.sh: KEY=value
+#                               export KEY=value
+#                               KEY="value"  / export KEY="value"
+current() {
+    local key="$1"
+    local val=""
+
+    # ── docker-compose.yml ──
+    if [[ -f "$COMPOSE_FILE" ]]; then
+        # special case: USB_DEV is stored as a literal device path in the
+        # devices: block  (e.g.  - /dev/sdb1:/dev/sdb1), not as KEY=value
+        if [[ "$key" == "USB_DEV" ]]; then
+            val=$(grep -E "^\s*-\s*/dev/" "$COMPOSE_FILE" \
+                  | head -n1 | sed 's|.*-\s*\(/dev/[^:]*\):.*|\1|;s/[[:space:]]//g' || true)
+        else
+            # list style:  - KEY=value
+            val=$(grep -E "^\s*-\s*${key}=" "$COMPOSE_FILE" \
+                  | head -n1 | sed "s/.*${key}=//;s/['\"]//g" || true)
+            if [[ -z "$val" ]]; then
+                # map style:  KEY: value
+                val=$(grep -E "^\s*${key}:" "$COMPOSE_FILE" \
+                      | head -n1 | sed "s/.*${key}:\s*//;s/['\"]//g" || true)
+            fi
+        fi
+    fi
+
+    # ── rescue_with_trigger.sh (fallback if not found in compose) ──
+    if [[ -z "$val" && -f "$RESCUE_FILE" ]]; then
+        val=$(grep -E "^(export\s+)?${key}=" "$RESCUE_FILE" \
+              | head -n1 | sed "s/.*${key}=//;s/^['\"]//;s/['\"]$//" || true)
+    fi
+
+    echo "$val"
+}
+
+# ─── update a key=value in docker-compose.yml ────────────────
+#     Handles both list style (- KEY=val) and map style (KEY: val)
+upsert_compose() {
+    local key="$1" value="$2"
+    if [[ ! -f "$COMPOSE_FILE" ]]; then return; fi
+
+    # list style:  - KEY=old  →  - KEY=new
+    if grep -qE "^\s*-\s*${key}=" "$COMPOSE_FILE"; then
+        sed -i.bak "s|^\(\s*-\s*\)${key}=.*|\1${key}=${value}|" "$COMPOSE_FILE" \
+            && rm -f "${COMPOSE_FILE}.bak"
+        return
+    fi
+
+    # map style:  KEY: old  →  KEY: new
+    if grep -qE "^\s*${key}:" "$COMPOSE_FILE"; then
+        sed -i.bak "s|^\(\s*\)${key}:.*|\1${key}: ${value}|" "$COMPOSE_FILE" \
+            && rm -f "${COMPOSE_FILE}.bak"
+        return
+    fi
+}
+
+# ─── special: replace literal USB device path in docker-compose.yml ──
+#     docker-compose uses the path directly, e.g.:
+#       devices:
+#         - /dev/sdb1:/dev/sdb1
+#     We find whatever /dev/… path is currently there and swap it out.
+upsert_compose_usb_dev() {
+    local new_dev="$1"
+    if [[ ! -f "$COMPOSE_FILE" ]]; then return; fi
+
+    # Detect the current literal path (fallback to known default)
+    local old_dev
+    old_dev=$(grep -E "^\s*-\s*/dev/" "$COMPOSE_FILE" \
+              | head -n1 | sed 's|.*-\s*\(/dev/[^:]*\):.*|\1|;s/[[:space:]]//g' || true)
+    old_dev="${old_dev:-$USB_DEV_DEFAULT}"
+
+    if [[ "$old_dev" == "$new_dev" ]]; then
+        info "USB_DEV already set to ${new_dev} in docker-compose.yml – no change."
+        return
+    fi
+
+    # Escape forward-slashes for sed
+    local old_esc new_esc
+    old_esc=$(printf '%s' "$old_dev" | sed 's|/|\\/|g')
+    new_esc=$(printf '%s' "$new_dev" | sed 's|/|\\/|g')
+
+    # Replace every occurrence of the old path in the file
+    sed -i.bak "s|${old_esc}|${new_esc}|g" "$COMPOSE_FILE" \
+        && rm -f "${COMPOSE_FILE}.bak"
+
+    ok "docker-compose.yml: replaced ${old_dev} → ${new_dev}"
+}
+
+# ─── update a key=value in rescue_with_trigger.sh ────────────
+#     Handles:  KEY=val  and  export KEY=val  (with/without quotes)
+upsert_rescue() {
+    local key="$1" value="$2"
+    if [[ ! -f "$RESCUE_FILE" ]]; then return; fi
+
+    # export KEY=...
+    if grep -qE "^export\s+${key}=" "$RESCUE_FILE"; then
+        sed -i.bak "s|^export\s\+${key}=.*|export ${key}=\"${value}\"|" "$RESCUE_FILE" \
+            && rm -f "${RESCUE_FILE}.bak"
+        return
+    fi
+
+    # plain KEY=...
+    if grep -qE "^${key}=" "$RESCUE_FILE"; then
+        sed -i.bak "s|^${key}=.*|${key}=\"${value}\"|" "$RESCUE_FILE" \
+            && rm -f "${RESCUE_FILE}.bak"
+        return
+    fi
+}
+
+# ─── update key in BOTH files (whichever contains it) ────────
 upsert() {
     local key="$1" value="$2"
-    if [[ -f "$ENV_FILE" ]] && grep -qE "^${key}=" "$ENV_FILE"; then
-        # replace existing line (portable sed)
-        sed -i.bak "s|^${key}=.*|${key}=${value}|" "$ENV_FILE" && rm -f "${ENV_FILE}.bak"
-    else
-        echo "${key}=${value}" >> "$ENV_FILE"
+    local updated=0
+
+    # USB_DEV: stored as a literal device path in docker-compose.yml, not as KEY=value
+    if [[ "$key" == "USB_DEV" ]]; then
+        upsert_compose_usb_dev "$value"
+        updated=1
+        # also update rescue_with_trigger.sh if it references USB_DEV there
+        if grep -qE "^(export\s+)?USB_DEV=" "$RESCUE_FILE" 2>/dev/null; then
+            upsert_rescue "USB_DEV" "$value"
+        fi
+        return
+    fi
+
+    # update in docker-compose.yml if key exists there
+    if grep -qE "^\s*(-\s*)?${key}[=:]" "$COMPOSE_FILE" 2>/dev/null; then
+        upsert_compose "$key" "$value"
+        updated=1
+    fi
+
+    # update in rescue_with_trigger.sh if key exists there
+    if grep -qE "^(export\s+)?${key}=" "$RESCUE_FILE" 2>/dev/null; then
+        upsert_rescue "$key" "$value"
+        updated=1
+    fi
+
+    if [[ $updated -eq 0 ]]; then
+        warn "Key '${key}' not found in docker-compose.yml or rescue_with_trigger.sh – skipped."
     fi
 }
 
@@ -77,7 +226,6 @@ detect_usb_dev() {
             candidates+=("$line")
         done < <(lsblk -nr -o PATH,TYPE,RM 2>/dev/null | awk '$2=="part" && $3==1 {print $1}')
     fi
-    # deduplicate
     printf '%s\n' "${candidates[@]}" | sort -u | head -5
 }
 
@@ -98,25 +246,24 @@ echo "  ║        SW Rescue – Environment Setup         ║"
 echo "  ╚══════════════════════════════════════════════╝"
 echo -e "${RESET}"
 
-# Check if .env already exists
-if [[ -f "$ENV_FILE" ]]; then
-    warn ".env already exists at $ENV_FILE"
-    echo -ne "  ${BOLD}Update existing values?${RESET} (press ENTER to keep current values) [Y/n]: "
-    read -r confirm
-    if [[ "${confirm,,}" == "n" ]]; then
-        ok "No changes made. Exiting."
-        exit 0
-    fi
-else
-    info "Creating new .env file at $ENV_FILE"
-    touch "$ENV_FILE"
+# ── Verify both target files exist before doing anything ─────
+check_files
+
+info "Target files:"
+info "  → $COMPOSE_FILE"
+info "  → $RESCUE_FILE"
+echo -ne "  ${BOLD}Update values in the above files?${RESET} (press ENTER to keep current values) [Y/n]: "
+read -r confirm
+if [[ "${confirm,,}" == "n" ]]; then
+    ok "No changes made. Exiting."
+    exit 0
 fi
 
 # ─── Section 1: Artifactory / Auth ───────────────────────────
 section "Artifactory / Authentication"
-ask "ARTIFACTORY_TOKEN_DT"             "Artifactory token (DT)"         ""          "true"
-ask "ARTIFACTORY_UNPROTECTED_USERNAME" "Artifactory username (unprotected)" ""       "false"
-ask "TOKEN_ACCESS"                     "GitLab / access token"          ""          "true"
+ask "ARTIFACTORY_TOKEN_DT"             "Artifactory token (DT)"                 ""     "true"
+ask "ARTIFACTORY_UNPROTECTED_USERNAME" "Artifactory username (unprotected)"     ""     "false"
+ask "TOKEN_ACCESS"                     "GitLab / access token"                  ""     "true"
 
 # ─── Section 2: Docker Image ─────────────────────────────────
 section "Docker Image"
@@ -140,10 +287,6 @@ if [[ ${#usb_devs[@]} -gt 0 ]]; then
     AUTO_USB_DEV="${usb_devs[0]}"
 
     # ── ⚠️  HOST-CONNECTED USB WARNING ───────────────────────
-    # A removable block device is visible on this host machine.
-    # For the SW Rescue flow the USB stick must be routed to the
-    # container via the Multiverse bench – NOT directly attached
-    # to the host.  Prompt the user to fix this before continuing.
     echo
     echo -e "${RED}${BOLD}╔══════════════════════════════════════════════════════════════╗"
     echo -e "║  ⚠️   WARNING – USB DEVICE DETECTED ON HOST MACHINE  ⚠️       ║"
@@ -178,7 +321,6 @@ if [[ ${#usb_devs[@]} -gt 0 ]]; then
 
         case "${usb_ans,,}" in
             yes|y)
-                # Re-check: if the device is still visible, warn again
                 mapfile -t recheck < <(detect_usb_dev)
                 if [[ ${#recheck[@]} -gt 0 ]]; then
                     echo
@@ -189,7 +331,6 @@ if [[ ${#usb_devs[@]} -gt 0 ]]; then
                 else
                     echo
                     ok "USB no longer detected on host. Continuing..."
-                    # Clear the auto-detected value – device is no longer on the host
                     AUTO_USB_DEV=""
                     usb_devs=()
                     echo
@@ -202,7 +343,6 @@ if [[ ${#usb_devs[@]} -gt 0 ]]; then
                 echo -e "  ${YELLOW}Setup will wait – press ENTER once you have made the switch.${RESET}"
                 echo -ne "  "
                 read -r
-                # Loop back to re-check
                 ;;
             skip|s)
                 echo
@@ -215,7 +355,6 @@ if [[ ${#usb_devs[@]} -gt 0 ]]; then
                 ;;
         esac
     done
-    # ── END WARNING ──────────────────────────────────────────
 
     if [[ ${#usb_devs[@]} -gt 0 ]]; then
         echo -e "  ${GREEN}Detected removable partitions:${RESET}"
@@ -265,18 +404,27 @@ ask "CI_PROJECT_DIR" "Project directory inside container" "/workspace"
 
 # ─── Summary ─────────────────────────────────────────────────
 echo
-section "Saved Variables"
-echo -e "  File: ${BOLD}$ENV_FILE${RESET}\n"
-while IFS='=' read -r k v; do
-    [[ "$k" =~ ^#.*$ || -z "$k" ]] && continue
-    if [[ "$k" =~ TOKEN|PASSWORD|SECRET ]]; then
-        echo -e "  ${CYAN}${k}${RESET} = ${YELLOW}*******${RESET}"
-    else
-        echo -e "  ${CYAN}${k}${RESET} = ${v}"
-    fi
-done < "$ENV_FILE"
+section "Updated Files"
+
+for target_file in "$COMPOSE_FILE" "$RESCUE_FILE"; do
+    echo -e "\n  ${BOLD}$(basename "$target_file")${RESET}  →  ${CYAN}${target_file}${RESET}"
+    for key in ARTIFACTORY_TOKEN_DT ARTIFACTORY_UNPROTECTED_USERNAME TOKEN_ACCESS \
+                MATRIX_IMAGE_VERSION RESCUE_URL USB_DEV \
+                USB_STICK_ID USB_STICK_MCH_PORT_ID USB_STICK_PORT_ID PHONE_USB_PORT_ID \
+                ADB_DEVICE_ID MOUNT_POINT CI_PROJECT_DIR; do
+        # check if key is present in this file
+        if grep -qE "(^\s*-?\s*${key}[=:]|^export\s+${key}=)" "$target_file" 2>/dev/null; then
+            val=$(current "$key")
+            if [[ "$key" =~ TOKEN|PASSWORD|SECRET ]]; then
+                echo -e "    ${CYAN}${key}${RESET} = ${YELLOW}*******${RESET}"
+            else
+                echo -e "    ${CYAN}${key}${RESET} = ${val}"
+            fi
+        fi
+    done
+done
 
 echo
-ok "Environment saved to $ENV_FILE"
+ok "Values updated in docker-compose.yml and rescue_with_trigger.sh"
 info "Run  'docker-compose up'  to start the rescue job."
 echo
